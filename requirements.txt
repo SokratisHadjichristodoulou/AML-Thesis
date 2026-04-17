@@ -1,0 +1,15 @@
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+networkx
+torch
+torch-geometric
+jupyter
+shap
+lime
+tqdm
+kaggle
+imbalanced-learn
+xgboost
