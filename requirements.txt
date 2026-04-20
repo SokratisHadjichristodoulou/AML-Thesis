@@ -13,3 +13,4 @@ tqdm
 kaggle
 imbalanced-learn
 xgboost
+torch_geometric

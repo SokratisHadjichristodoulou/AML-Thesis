@@ -168,3 +168,27 @@ def preprocess_elliptic_transactions_combined(df):
     df["class"] = df["class"].replace(2, 0)
 
     return df
+
+def preprocess_elliptic_graph(df):
+    """
+    Preprocess Elliptic Transaction-level features + classes dataset.
+
+    Steps:
+    1. Drop NaN rows
+    2. Rename class 2 -> 0
+
+    Returns:
+        Cleaned DataFrame
+    """
+
+    # -------------------------------
+    # 1. Drop NaN rows
+    # -------------------------------
+    df = df.dropna()
+
+    # -------------------------------
+    # 2. Rename class 2 -> 0
+    # -------------------------------
+    df["class"] = df["class"].replace(2, 0)
+
+    return df

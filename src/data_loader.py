@@ -8,6 +8,7 @@ from imblearn.over_sampling import SMOTE
 from src.preprocessing import preprocess_ethereum
 from src.preprocessing import preprocess_elliptic_wallets_combined
 from src.preprocessing import preprocess_elliptic_transactions_combined
+from src.preprocessing import preprocess_elliptic_graph
 
 # ---------------------------------------------------
 # Paths
@@ -42,6 +43,10 @@ def _get_elliptic_transactions_classes_raw_path():
 def _get_elliptic_transactions_combined_clean_path():
     root = _get_project_root()
     return root / "data" / "clean_datasets" / "elliptic_plus_plus" / "transactions_features_classes_combined_clean.csv"
+
+def _get_elliptic_graph_clean_path():
+    root = _get_project_root()
+    return root / "data" / "clean_datasets" / "elliptic_plus_plus" / "transactions_graph_clean.csv"
 
 # ---------------------------------------------------
 # Raw loader
@@ -119,6 +124,22 @@ def save_preprocessed_elliptic_transactions_combined(force=False):
     print(f"Saved cleaned dataset to: {clean_path}")
     return df
 
+def save_preprocessed_elliptic_graph(force=False):
+    clean_path = _get_elliptic_graph_clean_path()
+
+    if clean_path.exists() and not force:
+        print(f"Clean file already exists: {clean_path}")
+        return pd.read_csv(clean_path)
+
+    df = _load_raw_elliptic_transactions_combined()
+    df = preprocess_elliptic_graph(df)
+
+    clean_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(clean_path, index=False)
+
+    print(f"Saved cleaned dataset to: {clean_path}")
+    return df
+
 # ---------------------------------------------------
 # Load cleaned dataset
 # ---------------------------------------------------
@@ -148,6 +169,15 @@ def _load_preprocessed_elliptic_transactions_combined():
 
     # If the cleaned file does not exist yet, build it once
     return save_preprocessed_elliptic_transactions_combined()
+
+def _load_preprocessed_elliptic_graph():
+    clean_path = _get_elliptic_graph_clean_path()
+
+    if clean_path.exists():
+        return pd.read_csv(clean_path)
+
+    # If the cleaned file does not exist yet, build it once
+    return save_preprocessed_elliptic_graph()
 
 """
 def _load_raw_ethereum():
@@ -219,6 +249,71 @@ def _time_based_split_features_target(
         X_test = X_test.drop(columns=[time_col], errors="ignore")
 
     return X_train, X_test, y_train, y_test
+
+# ---------------------------------------------------
+# Time-step-boundary split for RQ2
+# Shared by: static feature baseline, static GNN, dynamic GNN
+#
+# Differs from _time_based_split_features_target:
+#   - Splits on TIME-STEP boundaries (not row positions), so no time step
+#     is ever cut in half. Required for clean per-timestep evaluation and
+#     for GNNs (no cross-split edges within a time step).
+#   - Returns train_time and test_time as separate metadata arrays so the
+#     model never sees Time step as a feature, but downstream code can
+#     group by time step for evaluation and temporal training.
+# ---------------------------------------------------
+def _time_step_boundary_split(
+    df,
+    target_col="class",
+    time_col="Time step",
+    test_size=0.2,
+):
+    """
+    Split a temporal dataset on time-step boundaries.
+
+    Guarantees that every row of a given time step lies entirely on one
+    side of the split. The time column is always removed from X_train and
+    X_test (model never sees it as a feature), but returned separately
+    as train_time and test_time for:
+      - Per-timestep evaluation (static baseline, static GNN, dynamic GNN)
+      - Temporal training loops (dynamic GNN only)
+
+    Parameters:
+        df: DataFrame containing features, target, and time column
+        target_col: name of the target column
+        time_col: name of the time-step column
+        test_size: fraction of UNIQUE time steps assigned to test
+                   (not row fraction)
+
+    Returns:
+        X_train, X_test, y_train, y_test, train_time, test_time
+        - All six objects have reset integer indices (0..n-1) aligned
+          row-for-row within the train split and within the test split.
+        - train_time and test_time are pd.Series of time-step values.
+    """
+    df = df.sort_values(time_col).reset_index(drop=True)
+
+    # Split on time-step boundaries
+    unique_steps = sorted(df[time_col].unique())
+    n_test_steps = max(1, int(round(len(unique_steps) * test_size)))
+    train_steps = unique_steps[:-n_test_steps]
+    test_steps  = unique_steps[-n_test_steps:]
+
+    train_df = df[df[time_col].isin(train_steps)].copy().reset_index(drop=True)
+    test_df  = df[df[time_col].isin(test_steps)].copy().reset_index(drop=True)
+
+    # Capture time steps BEFORE dropping the column
+    train_time = train_df[time_col].copy()
+    test_time  = test_df[time_col].copy()
+
+    # Drop target AND time column from features
+    X_train = train_df.drop(columns=[target_col, time_col])
+    X_test  = test_df.drop(columns=[target_col, time_col])
+
+    y_train = train_df[target_col]
+    y_test  = test_df[target_col]
+
+    return X_train, X_test, y_train, y_test, train_time, test_time
 
 def _scale_selected_columns(X_train, X_test, columns_to_scale):
     scaler = StandardScaler()
@@ -590,3 +685,59 @@ def load_transactions_combined_smote_scaled(
     X_train_sm = pd.DataFrame(X_train_sm, columns=X_train.columns)
 
     return X_train_sm, X_test_scaled, y_train_sm, y_test, scaler
+
+# ---------------------------------------------------
+# 13. Elliptic transactions Graph - RQ2 loader
+# Single source of truth for all three RQ2 stages:
+#   - Static feature baseline (uses: X_*, y_*, test_time)
+#   - Static GNN              (uses: X_*, y_*, test_time)
+#   - Dynamic GNN             (uses: X_*, y_*, train_time, test_time) 
+#
+#   - Static feature baseline (drop_unknowns=True):
+#       class-3 rows removed entirely from X/y/time arrays
+#   - Static GNN / Dynamic GNN (drop_unknowns=False):
+#       class-3 rows kept in X/y/time, plus boolean masks returned
+#       so the model can see them as graph nodes but skip them in loss
+# ---------------------------------------------------
+def load_transactions_graph_simple(
+    test_size=0.2,
+    target_col="class",
+    time_col="Time step",
+    drop_unknowns=True,
+    unknown_label=3,
+):
+    df = _load_preprocessed_elliptic_graph()
+
+    X_train, X_test, y_train, y_test, train_time, test_time = _time_step_boundary_split(
+        df,
+        target_col=target_col,
+        time_col=time_col,
+        test_size=test_size,
+    )
+
+    if drop_unknowns:
+        # Remove unknown-class rows entirely — feature baseline has no graph
+        # structure to benefit from keeping them.
+        train_mask = y_train != unknown_label
+        test_mask  = y_test  != unknown_label
+
+        X_train    = X_train.loc[train_mask].reset_index(drop=True)
+        y_train    = y_train.loc[train_mask].reset_index(drop=True)
+        train_time = train_time.loc[train_mask].reset_index(drop=True)
+
+        X_test     = X_test.loc[test_mask].reset_index(drop=True)
+        y_test     = y_test.loc[test_mask].reset_index(drop=True)
+        test_time  = test_time.loc[test_mask].reset_index(drop=True)
+
+        return X_train, X_test, y_train, y_test, train_time, test_time
+
+    # GNN stages: keep unknowns, return supervision masks so the caller can
+    # exclude them from loss and metrics while keeping them in the graph.
+    train_supervision_mask = (y_train != unknown_label).values
+    test_supervision_mask  = (y_test  != unknown_label).values
+
+    return (
+        X_train, X_test, y_train, y_test,
+        train_time, test_time,
+        train_supervision_mask, test_supervision_mask,
+    )
