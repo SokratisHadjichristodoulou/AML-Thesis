@@ -1,4 +1,8 @@
 import pandas as pd
+import numpy as np
+import torch
+import torch.nn.functional as F
+import random
 
 from src.data_loader import (
     # Ethereum
@@ -19,8 +23,10 @@ from src.data_loader import (
     load_transactions_combined_simple_scaled,
     load_transactions_combined_smote_scaled,
 
-    # Elliptic-Transactons- Graph
-    load_transactions_graph_simple
+    # Elliptic-Transactons-Graph
+    load_transactions_graph_baseline_simple, 
+    load_transactions_graph_gcn,
+    load_transactions_graph_temporal,
 )
 
 from src.feature_models import (
@@ -36,6 +42,12 @@ from src.feature_models import (
     get_svm_balanced,
     get_linear_svc,
     get_linear_svc_balanced,
+)
+
+from src.graph_models import (
+    get_gcn,
+    get_graphsage,
+    get_evolve_gcn,
 )
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -63,7 +75,7 @@ DATASET_LOADERS = {
         "scaled_smote": load_transactions_combined_smote_scaled,
     },
     "elliptic-transactions-graph": {
-        "simple": load_transactions_graph_simple,
+        "simple": load_transactions_graph_baseline_simple,
     },
 }
 
@@ -129,6 +141,235 @@ def get_dataset_loader(dataset_name, setup):
         raise ValueError(f"Unknown setup: {setup}")
 
     return DATASET_LOADERS[dataset_name][setup]
+
+def set_global_seed(seed=42, deterministic=True):
+    """
+    Make training as reproducible as possible across runs.
+
+    Parameters:
+        seed: integer random seed
+        deterministic: if True, ask PyTorch to use deterministic ops when possible
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        # Optional: stricter determinism in newer PyTorch versions
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+
+def _train_gcn(
+    data, 
+    hidden_channels=64, 
+    dropout=0.5, 
+    lr=0.01, 
+    weight_decay=5e-4, 
+    epochs=200, 
+    class_balanced=False, 
+    device="cpu", 
+    verbose=False,
+    seed=42, 
+    deterministic=True
+):
+    """
+    Standard full-batch GCN training loop with masking.
+    Returns the trained model and final logits on the full graph.
+    """
+    set_global_seed(seed, deterministic=deterministic)
+
+    model = get_gcn(
+        in_channels=data.x.shape[1],
+        hidden_channels=hidden_channels,
+        dropout=dropout,
+    ).to(device)
+
+    data = data.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    # Compute class weights on training labels only (matches our balanced baselines)
+    class_weights = None
+    if class_balanced:
+        y_train = data.y[data.train_mask]
+        n_pos = (y_train == 1).sum().item()
+        n_neg = (y_train == 0).sum().item()
+        pos_weight = min(n_neg / max(n_pos, 1), 3.0)  # cap at 3x
+        w = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=device)
+        class_weights = w
+
+    model.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        logits = model(data.x, data.edge_index)
+        loss = F.cross_entropy(
+            logits[data.train_mask],
+            data.y[data.train_mask],
+            weight=class_weights,
+        )
+        loss.backward()
+        optimizer.step()
+
+        if verbose and (epoch + 1) % 20 == 0:
+            print(f"Epoch {epoch+1:3d} | loss {loss.item():.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(data.x, data.edge_index)
+    return model, logits
+
+def _train_graphsage(
+    data,
+    hidden_channels=64,
+    dropout=0.5, 
+    lr=0.01, 
+    weight_decay=5e-4, 
+    epochs=200,
+    class_balanced=False, 
+    pos_weight_cap=3.0,
+    device="cpu", 
+    verbose=False, 
+    seed=42, 
+    deterministic=True
+):
+    """
+    Standard full-batch GraphSAGE training loop with masking.
+    Same skeleton as _train_gcn — only the model class differs.
+    """
+    set_global_seed(seed, deterministic=deterministic)
+
+    model = get_graphsage(
+        in_channels=data.x.shape[1],
+        hidden_channels=hidden_channels,
+        dropout=dropout,
+    ).to(device)
+
+    data = data.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    class_weights = None
+    if class_balanced:
+        y_train = data.y[data.train_mask]
+        n_pos = (y_train == 1).sum().item()
+        n_neg = (y_train == 0).sum().item()
+        pos_weight = min(n_neg / max(n_pos, 1), pos_weight_cap)
+        class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=device)
+
+    model.train()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        logits = model(data.x, data.edge_index)
+        loss = F.cross_entropy(
+            logits[data.train_mask],
+            data.y[data.train_mask],
+            weight=class_weights,
+        )
+        loss.backward()
+        optimizer.step()
+
+        if verbose and (epoch + 1) % 20 == 0:
+            print(f"Epoch {epoch+1:3d} | loss {loss.item():.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(data.x, data.edge_index)
+    return model, logits
+
+def _train_evolve_gcn(
+    bundle, 
+    hidden_channels=64, 
+    dropout=0.5, lr=0.01, 
+    weight_decay=5e-4, 
+    epochs=50, 
+    class_balanced=False, 
+    pos_weight_cap=3.0, 
+    device="cpu", 
+    verbose=False, 
+    seed=42, 
+    deterministic=True
+):
+    """
+    Train EvolveGCN-O on a sequence of graph snapshots.
+
+    Loss is accumulated across all training time steps per epoch.
+    """
+    set_global_seed(seed, deterministic=deterministic)
+
+    snapshots = [s.to(device) for s in bundle["snapshots"]]
+    train_steps = set(bundle["train_time_steps"])
+
+    model = get_evolve_gcn(
+        in_channels=bundle["n_features"],
+        hidden_channels=hidden_channels,
+        dropout=dropout,
+    ).to(device)
+
+    # Class weights from TRAIN snapshots only
+    if class_balanced:
+        all_train_y = torch.cat([
+            s.y[s.supervision_mask] for s in snapshots if s.time_step in train_steps
+        ])
+        n_pos = (all_train_y == 1).sum().item()
+        n_neg = (all_train_y == 0).sum().item()
+        pos_weight = min(n_neg / max(n_pos, 1), pos_weight_cap)
+        class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=device)
+    else:
+        class_weights = None
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    for epoch in range(epochs):
+        model.train()
+        model.reset_weights(device=device)
+        optimizer.zero_grad()
+
+        total_loss = 0.0
+        n_train_steps = 0
+
+        for snap in snapshots:
+            logits = model.forward_step(snap.x, snap.edge_index)
+
+            if snap.time_step in train_steps:
+                mask = snap.supervision_mask
+                if mask.sum() > 0:
+                    loss = F.cross_entropy(
+                        logits[mask],
+                        snap.y[mask],
+                        weight=class_weights,
+                    )
+                    total_loss = total_loss + loss
+                    n_train_steps += 1
+
+        if n_train_steps > 0:
+            total_loss = total_loss / n_train_steps
+            total_loss.backward()
+            optimizer.step()
+
+        if verbose and (epoch + 1) % 5 == 0:
+            print(f"Epoch {epoch+1:3d} | avg loss {total_loss.item():.4f}")
+
+    model.eval()
+    model.reset_weights(device=device)
+
+    per_step_outputs = {}
+    with torch.no_grad():
+        for snap in snapshots:
+            logits = model.forward_step(snap.x, snap.edge_index)
+            per_step_outputs[snap.time_step] = {
+                "logits": logits.cpu(),
+                "y": snap.y.cpu(),
+                "mask": snap.supervision_mask.cpu(),
+            }
+
+    return model, per_step_outputs
 
 # ---------------------------------------------------
 # Run all 3 setups for Random Forest
@@ -654,8 +895,7 @@ def run_lightgbm_graph_experiments(dataset="elliptic-transactions-graph"):
         **_evaluate(y_test, y_pred, y_proba)
     })
     per_timestep["simple"] = _evaluate_per_timestep(test_time, y_test, y_pred, y_proba)
-
-
+    
     # ---------------------------
     # 2. Simple + Balanced LightGBM
     # ---------------------------
@@ -676,5 +916,352 @@ def run_lightgbm_graph_experiments(dataset="elliptic-transactions-graph"):
     })
     per_timestep["simple_balanced"] = _evaluate_per_timestep(test_time, y_test, y_pred, y_proba)
 
-    
     return pd.DataFrame(results), per_timestep
+
+# ---------------------------------------------------
+# GRAPH EXPERIMENTS (static GNN for RQ2)
+# Only "simple" and "simple_balanced" setups.
+# Dataset: elliptic-transactions-graph (time-based split, no SMOTE, no scaling)
+# ---------------------------------------------------
+
+# ---------------------------------------------------
+# Run Simple 2 Layer GCN on graph dataset (simple + simple_balanced)
+# ---------------------------------------------------
+def run_gcn_experiments(
+    dataset="elliptic-transactions-graph", 
+    device="cpu", 
+    seeds=[42, 43, 44, 45, 46], 
+    deterministic=True
+):
+    all_runs = []
+    per_timestep_all = []
+
+    for seed in seeds:
+        results = []
+        per_timestep = {}
+
+        # ---------------------------
+        # 1. Simple (baseline GCN)
+        # ---------------------------
+        data = load_transactions_graph_gcn()
+        model, logits = _train_gcn(
+            data,
+            class_balanced=False,
+            device=device,
+            seed=seed,
+            deterministic=deterministic,
+        )
+
+        y_proba = F.softmax(logits, dim=1)[:, 1].cpu().numpy()
+        y_pred  = logits.argmax(dim=1).cpu().numpy()
+        y_true  = data.y.cpu().numpy()
+        mask    = data.test_mask.cpu().numpy()
+        t_all   = data.time_steps.cpu().numpy()
+
+        results.append({
+            "dataset": dataset.lower(),
+            "model": "GCN",
+            "setup": "simple",
+            **_evaluate(y_true[mask], y_pred[mask], y_proba[mask]),
+        })
+        per_timestep["simple"] = _evaluate_per_timestep(
+            t_all[mask], y_true[mask], y_pred[mask], y_proba[mask]
+        )
+
+        # ---------------------------
+        # 2. Simple + Balanced GCN
+        # ---------------------------
+        data = load_transactions_graph_gcn()
+        model, logits = _train_gcn(
+            data,
+            class_balanced=True,
+            device=device,
+            seed=seed,
+            deterministic=deterministic,
+        )
+
+        y_proba = F.softmax(logits, dim=1)[:, 1].cpu().numpy()
+        y_pred  = logits.argmax(dim=1).cpu().numpy()
+        y_true  = data.y.cpu().numpy()
+        mask    = data.test_mask.cpu().numpy()
+        t_all   = data.time_steps.cpu().numpy()
+
+        results.append({
+            "dataset": dataset.lower(),
+            "model": "GCN",
+            "setup": "simple_balanced",
+            **_evaluate(y_true[mask], y_pred[mask], y_proba[mask]),
+        })
+        per_timestep["simple_balanced"] = _evaluate_per_timestep(
+            t_all[mask], y_true[mask], y_pred[mask], y_proba[mask]
+        )
+
+        # Save aggregate results for this seed
+        df_seed = pd.DataFrame(results)
+        df_seed["seed"] = seed
+        all_runs.append(df_seed)
+
+        # Save per-time-step results for this seed
+        for setup_name, df_ts in per_timestep.items():
+            df_ts = df_ts.copy()
+            df_ts["model"] = "GCN"
+            df_ts["setup"] = setup_name
+            df_ts["seed"] = seed
+            per_timestep_all.append(df_ts)
+
+    # Combine all aggregate results
+    df_all = pd.concat(all_runs, ignore_index=True)
+
+    metrics = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+
+    df_mean = df_all.groupby(["dataset", "model", "setup"])[metrics].mean()
+    df_std  = df_all.groupby(["dataset", "model", "setup"])[metrics].std()
+
+    df_summary = df_mean.copy()
+    for m in metrics:
+        df_summary[m] = (
+            df_mean[m].round(4).astype(str) + " ± " + df_std[m].round(4).astype(str)
+        )
+
+    df_summary = df_summary.reset_index()
+
+    # Combine all per-time-step results
+    df_per_timestep = pd.concat(per_timestep_all, ignore_index=True)
+
+    return df_summary, df_per_timestep
+
+# ---------------------------------------------------
+# Run Simple 2 Layer graphSAGE on graph dataset (simple + simple_balanced)
+# ---------------------------------------------------
+def run_graphsage_experiments(
+    dataset="elliptic-transactions-graph", 
+    device="cpu", 
+    seeds=[42, 43, 44, 45, 46], 
+    deterministic=True
+):
+    all_runs = []
+    per_timestep_all = []
+
+    for seed in seeds:
+        results = []
+        per_timestep = {}
+
+        # ---------------------------
+        # 1. Simple (baseline GraphSAGE)
+        # ---------------------------
+        data = load_transactions_graph_gcn()
+        model, logits = _train_graphsage(
+            data,
+            class_balanced=False,
+            device=device,
+            seed=seed,
+            deterministic=deterministic,
+        )
+
+        y_proba = F.softmax(logits, dim=1)[:, 1].cpu().numpy()
+        y_pred  = logits.argmax(dim=1).cpu().numpy()
+        y_true  = data.y.cpu().numpy()
+        mask    = data.test_mask.cpu().numpy()
+        t_all   = data.time_steps.cpu().numpy()
+
+        results.append({
+            "dataset": dataset.lower(),
+            "model": "GraphSAGE",
+            "setup": "simple",
+            **_evaluate(y_true[mask], y_pred[mask], y_proba[mask]),
+        })
+        per_timestep["simple"] = _evaluate_per_timestep(
+            t_all[mask], y_true[mask], y_pred[mask], y_proba[mask]
+        )
+
+        # ---------------------------
+        # 2. Simple + Balanced GraphSAGE
+        # ---------------------------
+        data = load_transactions_graph_gcn()
+        model, logits = _train_graphsage(
+            data,
+            class_balanced=True,
+            device=device,
+            seed=seed,
+            deterministic=deterministic,
+        )
+
+        y_proba = F.softmax(logits, dim=1)[:, 1].cpu().numpy()
+        y_pred  = logits.argmax(dim=1).cpu().numpy()
+        y_true  = data.y.cpu().numpy()
+        mask    = data.test_mask.cpu().numpy()
+        t_all   = data.time_steps.cpu().numpy()
+
+        results.append({
+            "dataset": dataset.lower(),
+            "model": "GraphSAGE",
+            "setup": "simple_balanced",
+            **_evaluate(y_true[mask], y_pred[mask], y_proba[mask]),
+        })
+        per_timestep["simple_balanced"] = _evaluate_per_timestep(
+            t_all[mask], y_true[mask], y_pred[mask], y_proba[mask]
+        )
+
+        # Save aggregate results for this seed
+        df_seed = pd.DataFrame(results)
+        df_seed["seed"] = seed
+        all_runs.append(df_seed)
+
+        # Save per-time-step results for this seed
+        for setup_name, df_ts in per_timestep.items():
+            df_ts = df_ts.copy()
+            df_ts["model"] = "GraphSAGE"
+            df_ts["setup"] = setup_name
+            df_ts["seed"] = seed
+            per_timestep_all.append(df_ts)
+
+    # Combine all aggregate results
+    df_all = pd.concat(all_runs, ignore_index=True)
+
+    metrics = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+
+    df_mean = df_all.groupby(["dataset", "model", "setup"])[metrics].mean()
+    df_std  = df_all.groupby(["dataset", "model", "setup"])[metrics].std()
+
+    df_summary = df_mean.copy()
+    for m in metrics:
+        df_summary[m] = (
+            df_mean[m].round(4).astype(str) + " ± " + df_std[m].round(4).astype(str)
+        )
+
+    df_summary = df_summary.reset_index()
+
+    # Combine all per-time-step results
+    df_per_timestep = pd.concat(per_timestep_all, ignore_index=True)
+
+    return df_summary, df_per_timestep
+
+# ---------------------------------------------------
+# Run EvolveGCN-O on graph dataset (simple + simple_balanced)
+# ---------------------------------------------------
+def run_evolve_gcn_experiments(
+    dataset="elliptic-transactions-graph", 
+    device="cpu", 
+    seeds=[42, 43, 44, 45, 46], 
+    deterministic=True,
+):
+    all_runs = []
+    per_timestep_all = []
+
+    for seed in seeds:
+        results = []
+        per_timestep = {}
+
+        bundle = load_transactions_graph_temporal()
+        test_steps = set(bundle["test_time_steps"])
+
+        # ---------------------------
+        # 1. Simple
+        # ---------------------------
+        _, outputs = _train_evolve_gcn(
+            bundle,
+            class_balanced=False,
+            device=device,
+            seed=seed,
+            deterministic=deterministic,
+        )
+
+        agg_y, agg_pred, agg_proba, agg_t = [], [], [], []
+        for t, out in outputs.items():
+            if t in test_steps:
+                mask = out["mask"].numpy()
+                y_true = out["y"].numpy()[mask]
+                y_pred = out["logits"].argmax(dim=1).numpy()[mask]
+                y_proba = F.softmax(out["logits"], dim=1)[:, 1].numpy()[mask]
+
+                agg_y.extend(y_true)
+                agg_pred.extend(y_pred)
+                agg_proba.extend(y_proba)
+                agg_t.extend([t] * len(y_true))
+
+        agg_y = np.array(agg_y)
+        agg_pred = np.array(agg_pred)
+        agg_proba = np.array(agg_proba)
+        agg_t = np.array(agg_t)
+
+        results.append({
+            "dataset": dataset.lower(),
+            "model": "EvolveGCN-O",
+            "setup": "simple",
+            **_evaluate(agg_y, agg_pred, agg_proba),
+        })
+        per_timestep["simple"] = _evaluate_per_timestep(
+            agg_t, agg_y, agg_pred, agg_proba
+        )
+
+        # ---------------------------
+        # 2. Simple + Balanced
+        # ---------------------------
+        _, outputs = _train_evolve_gcn(
+            bundle,
+            class_balanced=True,
+            device=device,
+            seed=seed,
+            deterministic=deterministic,
+        )
+
+        agg_y, agg_pred, agg_proba, agg_t = [], [], [], []
+        for t, out in outputs.items():
+            if t in test_steps:
+                mask = out["mask"].numpy()
+                y_true = out["y"].numpy()[mask]
+                y_pred = out["logits"].argmax(dim=1).numpy()[mask]
+                y_proba = F.softmax(out["logits"], dim=1)[:, 1].numpy()[mask]
+
+                agg_y.extend(y_true)
+                agg_pred.extend(y_pred)
+                agg_proba.extend(y_proba)
+                agg_t.extend([t] * len(y_true))
+
+        agg_y = np.array(agg_y)
+        agg_pred = np.array(agg_pred)
+        agg_proba = np.array(agg_proba)
+        agg_t = np.array(agg_t)
+
+        results.append({
+            "dataset": dataset.lower(),
+            "model": "EvolveGCN-O",
+            "setup": "simple_balanced",
+            **_evaluate(agg_y, agg_pred, agg_proba),
+        })
+        per_timestep["simple_balanced"] = _evaluate_per_timestep(
+            agg_t, agg_y, agg_pred, agg_proba
+        )
+        
+        # Save aggregate results for this seed
+        df_seed = pd.DataFrame(results)
+        df_seed["seed"] = seed
+        all_runs.append(df_seed)
+
+        # Save per-time-step results for this seed
+        for setup_name, df_ts in per_timestep.items():
+            df_ts = df_ts.copy()
+            df_ts["model"] = "EvolveGCN-O"
+            df_ts["setup"] = setup_name
+            df_ts["seed"] = seed
+            per_timestep_all.append(df_ts)
+        
+    # Aggregate across seeds
+    df_all = pd.concat(all_runs, ignore_index=True)
+
+    metrics = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+
+    df_mean = df_all.groupby(["dataset", "model", "setup"])[metrics].mean()
+    df_std  = df_all.groupby(["dataset", "model", "setup"])[metrics].std()
+
+    df_summary = df_mean.copy()
+    for m in metrics:
+        df_summary[m] = (
+            df_mean[m].round(4).astype(str) + " ± " + df_std[m].round(4).astype(str)
+        )
+
+    df_summary = df_summary.reset_index()
+
+    df_per_timestep = pd.concat(per_timestep_all, ignore_index=True)
+
+    return df_summary, df_per_timestep

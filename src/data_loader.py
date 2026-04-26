@@ -1,9 +1,12 @@
 import pandas as pd
 from pathlib import Path
+import torch
+import numpy as np
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from imblearn.over_sampling import SMOTE
+from torch_geometric.data import Data
 
 from src.preprocessing import preprocess_ethereum
 from src.preprocessing import preprocess_elliptic_wallets_combined
@@ -47,6 +50,10 @@ def _get_elliptic_transactions_combined_clean_path():
 def _get_elliptic_graph_clean_path():
     root = _get_project_root()
     return root / "data" / "clean_datasets" / "elliptic_plus_plus" / "transactions_graph_clean.csv"
+
+def _get_transactions_edgelist_path():
+    root = _get_project_root()
+    return root / "data" / "elliptic_plus_plus" / "transactions" / "txs_edgelist.csv"
 
 # ---------------------------------------------------
 # Raw loader
@@ -178,6 +185,9 @@ def _load_preprocessed_elliptic_graph():
 
     # If the cleaned file does not exist yet, build it once
     return save_preprocessed_elliptic_graph()
+
+def _load_transactions_edgelist():
+    return pd.read_csv(_get_transactions_edgelist_path())
 
 """
 def _load_raw_ethereum():
@@ -699,7 +709,7 @@ def load_transactions_combined_smote_scaled(
 #       class-3 rows kept in X/y/time, plus boolean masks returned
 #       so the model can see them as graph nodes but skip them in loss
 # ---------------------------------------------------
-def load_transactions_graph_simple(
+def load_transactions_graph_baseline_simple(
     test_size=0.2,
     target_col="class",
     time_col="Time step",
@@ -741,3 +751,150 @@ def load_transactions_graph_simple(
         train_time, test_time,
         train_supervision_mask, test_supervision_mask,
     )
+
+# ---------------------------------------------------
+# 14. Elliptic transactions Graph - GCN loader (RQ2)
+# Builds a PyTorch Geometric Data object from:
+#   - nodes:  transactions_graph_clean.csv (txId, Time step, features, class)
+#   - edges:  txs_edgelist.csv (txId1 -> txId2)
+# Unknowns (class 3) are kept as graph nodes but masked out of supervision.
+# ---------------------------------------------------
+def load_transactions_graph_gcn(
+    test_size=0.2,
+    target_col="class",
+    time_col="Time step",
+    id_col="txId",
+    unknown_label=3,
+):
+    # 1. Load nodes (preprocessed graph CSV) and edges
+    nodes_df = _load_preprocessed_elliptic_graph()
+    edges_df = _load_transactions_edgelist()
+
+    # 2. Sort nodes by time (same ordering as _time_step_boundary_split)
+    nodes_df = nodes_df.sort_values(time_col).reset_index(drop=True)
+
+    # 3. Build a mapping: txId -> row index (node index in the graph)
+    txid_to_idx = {txid: i for i, txid in enumerate(nodes_df[id_col].values)}
+
+    # 4. Convert edges to node-index pairs, drop edges with unknown endpoints
+    src = edges_df["txId1"].map(txid_to_idx)
+    dst = edges_df["txId2"].map(txid_to_idx)
+    valid = src.notna() & dst.notna()
+    edge_index = torch.tensor(
+        np.stack([src[valid].astype(int).values, dst[valid].astype(int).values]),
+        dtype=torch.long,
+    )
+
+    # 5. Build time-step-boundary split on node rows
+    unique_steps = sorted(nodes_df[time_col].unique())
+    n_test_steps = max(1, int(round(len(unique_steps) * test_size)))
+    train_steps = unique_steps[:-n_test_steps]
+    test_steps  = unique_steps[-n_test_steps:]
+
+    time_series = nodes_df[time_col].values
+    labels      = nodes_df[target_col].values
+
+    train_mask = torch.tensor(
+        [(t in train_steps) and (c != unknown_label) for t, c in zip(time_series, labels)],
+        dtype=torch.bool,
+    )
+    test_mask  = torch.tensor(
+        [(t in test_steps)  and (c != unknown_label) for t, c in zip(time_series, labels)],
+        dtype=torch.bool,
+    )
+
+    # 6. Node features: drop id, time, and class
+    x = nodes_df.drop(columns=[id_col, time_col, target_col]).values.astype("float32")
+    x = torch.tensor(x, dtype=torch.float32)
+
+    # 7. Labels: replace class 3 with 0 just to have a valid int (masks handle exclusion)
+    y_clean = pd.Series(labels).replace(unknown_label, 0).values
+    y = torch.tensor(y_clean, dtype=torch.long)
+
+    time_steps = torch.tensor(time_series, dtype=torch.long)
+
+    # 8. Pack into a PyG Data object
+    data = Data(x=x, edge_index=edge_index, y=y)
+    data.train_mask = train_mask
+    data.test_mask  = test_mask
+    data.time_steps = time_steps
+
+    return data
+
+def load_transactions_graph_temporal(
+    target_col="class",
+    time_col="Time step",
+    id_col="txId",
+    unknown_label=3,
+    test_size=0.2,
+):
+    """
+    Build a list of per-timestep graph snapshots for dynamic GNN training.
+
+    Returns a dict with:
+        snapshots: list of PyG Data objects, one per time step
+        train_time_steps: list of ints
+        test_time_steps: list of ints
+        n_features: int
+    """
+    nodes_df = _load_preprocessed_elliptic_graph()
+    edges_df = _load_transactions_edgelist()
+
+    nodes_df = nodes_df.sort_values(time_col).reset_index(drop=True)
+
+    # Time-step boundary split
+    unique_steps = sorted(nodes_df[time_col].unique())
+    n_test_steps = max(1, int(round(len(unique_steps) * test_size)))
+    train_time_steps = unique_steps[:-n_test_steps]
+    test_time_steps  = unique_steps[-n_test_steps:]
+
+    # Feature columns = everything except id, time, class
+    feature_cols = [c for c in nodes_df.columns if c not in [id_col, time_col, target_col]]
+
+    snapshots = []
+    for t in unique_steps:
+        nodes_t = nodes_df[nodes_df[time_col] == t].reset_index(drop=True)
+
+        local_ids = nodes_t[id_col].values
+        local_to_new_idx = {txid: i for i, txid in enumerate(local_ids)}
+
+        # Keep only edges fully inside this snapshot
+        local_id_set = set(local_ids)
+        edges_t = edges_df[
+            edges_df["txId1"].isin(local_id_set) & edges_df["txId2"].isin(local_id_set)
+        ]
+
+        if len(edges_t) > 0:
+            src = edges_t["txId1"].map(local_to_new_idx).astype(int).values
+            dst = edges_t["txId2"].map(local_to_new_idx).astype(int).values
+            edge_index = torch.tensor(
+                np.stack([src, dst]),
+                dtype=torch.long,
+            )
+        else:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+
+        x = torch.tensor(
+            nodes_t[feature_cols].values.astype("float32"),
+            dtype=torch.float32,
+        )
+
+        labels = nodes_t[target_col].values
+        y = torch.tensor(
+            pd.Series(labels).replace(unknown_label, 0).values,
+            dtype=torch.long,
+        )
+
+        supervision_mask = torch.tensor(labels != unknown_label, dtype=torch.bool)
+
+        snap = Data(x=x, edge_index=edge_index, y=y)
+        snap.supervision_mask = supervision_mask
+        snap.time_step = int(t)
+        snapshots.append(snap)
+
+    return {
+        "snapshots": snapshots,
+        "train_time_steps": train_time_steps,
+        "test_time_steps": test_time_steps,
+        "n_features": len(feature_cols),
+    }
