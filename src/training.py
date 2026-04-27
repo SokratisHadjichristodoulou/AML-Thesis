@@ -1140,128 +1140,99 @@ def run_graphsage_experiments(
 # Run EvolveGCN-O on graph dataset (simple + simple_balanced)
 # ---------------------------------------------------
 def run_evolve_gcn_experiments(
-    dataset="elliptic-transactions-graph", 
-    device="cpu", 
-    seeds=[42, 43, 44, 45, 46], 
+    dataset="elliptic-transactions-graph",
+    device="cpu",
+    seed=42,
     deterministic=True,
 ):
-    all_runs = []
-    per_timestep_all = []
+    results = []
+    per_timestep = {}
 
-    for seed in seeds:
-        results = []
-        per_timestep = {}
+    bundle = load_transactions_graph_temporal()
+    test_steps = set(bundle["test_time_steps"])
 
-        bundle = load_transactions_graph_temporal()
-        test_steps = set(bundle["test_time_steps"])
+    # ---------------------------
+    # 1. Simple
+    # ---------------------------
+    _, outputs = _train_evolve_gcn(
+        bundle,
+        class_balanced=False,
+        device=device,
+        seed=seed,
+        deterministic=deterministic,
+        epochs=50,
+    )
 
-        # ---------------------------
-        # 1. Simple
-        # ---------------------------
-        _, outputs = _train_evolve_gcn(
-            bundle,
-            class_balanced=False,
-            device=device,
-            seed=seed,
-            deterministic=deterministic,
-        )
+    agg_y, agg_pred, agg_proba, agg_t = [], [], [], []
 
-        agg_y, agg_pred, agg_proba, agg_t = [], [], [], []
-        for t, out in outputs.items():
-            if t in test_steps:
-                mask = out["mask"].numpy()
-                y_true = out["y"].numpy()[mask]
-                y_pred = out["logits"].argmax(dim=1).numpy()[mask]
-                y_proba = F.softmax(out["logits"], dim=1)[:, 1].numpy()[mask]
+    for t, out in outputs.items():
+        if t in test_steps:
+            mask = out["mask"].numpy()
+            y_true = out["y"].numpy()[mask]
+            y_pred = out["logits"].argmax(dim=1).numpy()[mask]
+            y_proba = F.softmax(out["logits"], dim=1)[:, 1].numpy()[mask]
 
-                agg_y.extend(y_true)
-                agg_pred.extend(y_pred)
-                agg_proba.extend(y_proba)
-                agg_t.extend([t] * len(y_true))
+            agg_y.extend(y_true)
+            agg_pred.extend(y_pred)
+            agg_proba.extend(y_proba)
+            agg_t.extend([t] * len(y_true))
 
-        agg_y = np.array(agg_y)
-        agg_pred = np.array(agg_pred)
-        agg_proba = np.array(agg_proba)
-        agg_t = np.array(agg_t)
+    agg_y = np.array(agg_y)
+    agg_pred = np.array(agg_pred)
+    agg_proba = np.array(agg_proba)
+    agg_t = np.array(agg_t)
 
-        results.append({
-            "dataset": dataset.lower(),
-            "model": "EvolveGCN-O",
-            "setup": "simple",
-            **_evaluate(agg_y, agg_pred, agg_proba),
-        })
-        per_timestep["simple"] = _evaluate_per_timestep(
-            agg_t, agg_y, agg_pred, agg_proba
-        )
+    results.append({
+        "dataset": dataset.lower(),
+        "model": "EvolveGCN-O",
+        "setup": "simple",
+        **_evaluate(agg_y, agg_pred, agg_proba),
+    })
 
-        # ---------------------------
-        # 2. Simple + Balanced
-        # ---------------------------
-        _, outputs = _train_evolve_gcn(
-            bundle,
-            class_balanced=True,
-            device=device,
-            seed=seed,
-            deterministic=deterministic,
-        )
+    per_timestep["simple"] = _evaluate_per_timestep(
+        agg_t, agg_y, agg_pred, agg_proba
+    )
 
-        agg_y, agg_pred, agg_proba, agg_t = [], [], [], []
-        for t, out in outputs.items():
-            if t in test_steps:
-                mask = out["mask"].numpy()
-                y_true = out["y"].numpy()[mask]
-                y_pred = out["logits"].argmax(dim=1).numpy()[mask]
-                y_proba = F.softmax(out["logits"], dim=1)[:, 1].numpy()[mask]
+    # ---------------------------
+    # 2. Simple + Balanced
+    # ---------------------------
+    _, outputs = _train_evolve_gcn(
+        bundle,
+        class_balanced=True,
+        device=device,
+        seed=seed,
+        deterministic=deterministic,
+        epochs=50,
+    )
 
-                agg_y.extend(y_true)
-                agg_pred.extend(y_pred)
-                agg_proba.extend(y_proba)
-                agg_t.extend([t] * len(y_true))
+    agg_y, agg_pred, agg_proba, agg_t = [], [], [], []
 
-        agg_y = np.array(agg_y)
-        agg_pred = np.array(agg_pred)
-        agg_proba = np.array(agg_proba)
-        agg_t = np.array(agg_t)
+    for t, out in outputs.items():
+        if t in test_steps:
+            mask = out["mask"].numpy()
+            y_true = out["y"].numpy()[mask]
+            y_pred = out["logits"].argmax(dim=1).numpy()[mask]
+            y_proba = F.softmax(out["logits"], dim=1)[:, 1].numpy()[mask]
 
-        results.append({
-            "dataset": dataset.lower(),
-            "model": "EvolveGCN-O",
-            "setup": "simple_balanced",
-            **_evaluate(agg_y, agg_pred, agg_proba),
-        })
-        per_timestep["simple_balanced"] = _evaluate_per_timestep(
-            agg_t, agg_y, agg_pred, agg_proba
-        )
-        
-        # Save aggregate results for this seed
-        df_seed = pd.DataFrame(results)
-        df_seed["seed"] = seed
-        all_runs.append(df_seed)
+            agg_y.extend(y_true)
+            agg_pred.extend(y_pred)
+            agg_proba.extend(y_proba)
+            agg_t.extend([t] * len(y_true))
 
-        # Save per-time-step results for this seed
-        for setup_name, df_ts in per_timestep.items():
-            df_ts = df_ts.copy()
-            df_ts["model"] = "EvolveGCN-O"
-            df_ts["setup"] = setup_name
-            df_ts["seed"] = seed
-            per_timestep_all.append(df_ts)
-        
-    # Aggregate across seeds
-    df_all = pd.concat(all_runs, ignore_index=True)
+    agg_y = np.array(agg_y)
+    agg_pred = np.array(agg_pred)
+    agg_proba = np.array(agg_proba)
+    agg_t = np.array(agg_t)
 
-    metrics = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+    results.append({
+        "dataset": dataset.lower(),
+        "model": "EvolveGCN-O",
+        "setup": "simple_balanced",
+        **_evaluate(agg_y, agg_pred, agg_proba),
+    })
 
-    df_mean = df_all.groupby(["dataset", "model", "setup"])[metrics].mean()
-    df_std  = df_all.groupby(["dataset", "model", "setup"])[metrics].std()
+    per_timestep["simple_balanced"] = _evaluate_per_timestep(
+        agg_t, agg_y, agg_pred, agg_proba
+    )
 
-    df_summary = df_mean.copy()
-    for m in metrics:
-        df_summary[m] = (
-            df_mean[m].round(4).astype(str) + " ± " + df_std[m].round(4).astype(str)
-        )
-
-    df_summary = df_summary.reset_index()
-
-    df_per_timestep = pd.concat(per_timestep_all, ignore_index=True)
-
-    return df_summary, df_per_timestep
+    return pd.DataFrame(results), per_timestep
