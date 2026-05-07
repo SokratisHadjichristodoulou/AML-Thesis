@@ -591,12 +591,11 @@ def load_transactions_combined_simple(
 ):
     df = _load_preprocessed_elliptic_transactions_combined()
 
-    X_train, X_test, y_train, y_test = _time_based_split_features_target(
+    X_train, X_test, y_train, y_test, _, _ = _time_step_boundary_split(
         df,
         target_col=target_col,
         time_col=time_col,
         test_size=test_size,
-        drop_time_from_features=drop_time_from_features,
     )
 
     return X_train, X_test, y_train, y_test
@@ -613,12 +612,11 @@ def load_transactions_combined_smote(
 ):
     df = _load_preprocessed_elliptic_transactions_combined()
 
-    X_train, X_test, y_train, y_test = _time_based_split_features_target(
+    X_train, X_test, y_train, y_test, _, _ = _time_step_boundary_split(
         df,
         target_col=target_col,
         time_col=time_col,
         test_size=test_size,
-        drop_time_from_features=drop_time_from_features,
     )
 
     smote = SMOTE(random_state=smote_random_state)
@@ -640,12 +638,11 @@ def load_transactions_combined_simple_scaled(
 ):
     df = _load_preprocessed_elliptic_transactions_combined()
 
-    X_train, X_test, y_train, y_test = _time_based_split_features_target(
+    X_train, X_test, y_train, y_test, _, _ = _time_step_boundary_split(
         df,
         target_col=target_col,
         time_col=time_col,
         test_size=test_size,
-        drop_time_from_features=drop_time_from_features,
     )
 
     # Columns 168-184
@@ -672,12 +669,11 @@ def load_transactions_combined_smote_scaled(
 ):
     df = _load_preprocessed_elliptic_transactions_combined()
 
-    X_train, X_test, y_train, y_test = _time_based_split_features_target(
+    X_train, X_test, y_train, y_test, _, _ = _time_step_boundary_split(
         df,
         target_col=target_col,
         time_col=time_col,
         test_size=test_size,
-        drop_time_from_features=drop_time_from_features,
     )
 
     # Columns 168-184
