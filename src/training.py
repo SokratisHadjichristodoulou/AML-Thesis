@@ -1236,3 +1236,27 @@ def run_evolve_gcn_experiments(
     )
 
     return pd.DataFrame(results), per_timestep
+
+# ---------------------------------------------------
+# XAI training wrappers for RQ3
+# ---------------------------------------------------
+def train_graphsage_xai(
+    data,
+    device="cpu",
+    seed=42,
+    deterministic=True,
+    class_balanced=False,
+):
+    """
+    Public wrapper for training GraphSAGE for RQ3 XAI.
+    """
+
+    model, logits = _train_graphsage(
+        data=data,
+        class_balanced=class_balanced,
+        device=device,
+        seed=seed,
+        deterministic=deterministic,
+    )
+
+    return model, logits

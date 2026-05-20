@@ -1,0 +1,4 @@
+dataset,model,setup,accuracy,precision,recall,f1,roc_auc
+elliptic-wallets-combined,Linear SVC,scaled,0.9744844459979028,0.535,0.08525896414342629,0.1470790378006873,
+elliptic-wallets-combined,Linear SVC,scaled_balanced,0.8959434175627609,0.1440329218106996,0.6135458167330677,0.23329798515376457,
+elliptic-wallets-combined,Linear SVC,scaled_smote,0.8976499372905401,0.14670715505788576,0.6159362549800796,0.23697118332311465,

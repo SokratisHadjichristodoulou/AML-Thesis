@@ -1,0 +1,2 @@
+dataset,model,accuracy,precision,recall,f1,roc_auc
+elliptic-wallets-combined,LightGBM balanced,0.9616547073215864,0.3928320449754041,0.8908366533864542,0.5452328700316996,0.9850870293676504

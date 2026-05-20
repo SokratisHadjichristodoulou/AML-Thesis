@@ -234,32 +234,6 @@ def _split_features_target(df, target_col="class", test_size=0.2, random_state=4
         stratify=y if shuffle else None
     )
 
-def _time_based_split_features_target(
-    df,
-    target_col="class",
-    time_col="Time step",
-    test_size=0.2,
-    drop_time_from_features=True,
-):
-    df = df.sort_values(time_col).reset_index(drop=True)
-
-    split_idx = int(len(df) * (1 - test_size))
-
-    train_df = df.iloc[:split_idx].copy()
-    test_df = df.iloc[split_idx:].copy()
-
-    X_train = train_df.drop(columns=[target_col])
-    X_test = test_df.drop(columns=[target_col])
-
-    y_train = train_df[target_col]
-    y_test = test_df[target_col]
-
-    if drop_time_from_features:
-        X_train = X_train.drop(columns=[time_col], errors="ignore")
-        X_test = X_test.drop(columns=[time_col], errors="ignore")
-
-    return X_train, X_test, y_train, y_test
-
 # ---------------------------------------------------
 # Time-step-boundary split for RQ2
 # Shared by: static feature baseline, static GNN, dynamic GNN
@@ -894,3 +868,80 @@ def load_transactions_graph_temporal(
         "test_time_steps": test_time_steps,
         "n_features": len(feature_cols),
     }
+
+# ---------------------------------------------------
+# XAI loaders for RQ3
+# ---------------------------------------------------
+def load_feature_xai_dataset(dataset="elliptic-transactions-combined"):
+    """
+    Loader for SHAP explanations in RQ3.
+
+    Supported datasets:
+        - ethereum
+        - elliptic-wallets-combined
+        - elliptic-transactions-combined
+
+    Returns:
+        X_train, X_test, y_train, y_test
+    """
+
+    dataset = dataset.lower()
+
+    if dataset == "ethereum":
+        return load_ethereum_simple()
+
+    if dataset == "elliptic-wallets-combined":
+        return load_wallet_combined_simple()
+
+    if dataset == "elliptic-transactions-combined":
+        return load_transactions_combined_simple()
+
+    raise ValueError(f"Unknown feature XAI dataset: {dataset}")
+
+
+def load_graph_xai_dataset(
+    test_size=0.2,
+    target_col="class",
+    time_col="Time step",
+    id_col="txId",
+    unknown_label=3,
+):
+    """
+    Loader for GNNExplainer in RQ3.
+
+    Returns:
+        data: PyTorch Geometric Data object
+        metadata: dictionary with:
+            - nodes_df
+            - feature_names
+            - test_illicit_nodes
+    """
+
+    data = load_transactions_graph_gcn(
+        test_size=test_size,
+        target_col=target_col,
+        time_col=time_col,
+        id_col=id_col,
+        unknown_label=unknown_label,
+    )
+
+    nodes_df = _load_preprocessed_elliptic_graph()
+    nodes_df = nodes_df.sort_values(time_col).reset_index(drop=True)
+
+    feature_names = [
+        col for col in nodes_df.columns
+        if col not in [id_col, time_col, target_col]
+    ]
+
+    test_illicit_nodes = (
+        (data.test_mask == True) &
+        (data.y == 1)
+    ).nonzero(as_tuple=True)[0].cpu().numpy().tolist()
+
+    metadata = {
+        "nodes_df": nodes_df,
+        "feature_names": feature_names,
+        "test_illicit_nodes": test_illicit_nodes,
+    }
+
+    return data, metadata

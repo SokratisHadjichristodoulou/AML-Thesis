@@ -1,0 +1,2 @@
+dataset,model,accuracy,precision,recall,f1,roc_auc
+elliptic-transactions-combined,Random Forest balanced,0.9733610258262597,0.9802816901408451,0.5471698113207547,0.7023208879919274,0.9397542512180339

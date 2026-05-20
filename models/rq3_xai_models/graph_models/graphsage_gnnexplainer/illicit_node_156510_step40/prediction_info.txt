@@ -1,0 +1,6 @@
+node_index: 156510
+time_step: 40
+true_label: 1 (illicit)
+predicted_label: 1
+fraud_probability: 0.5182
+correctly_classified: True

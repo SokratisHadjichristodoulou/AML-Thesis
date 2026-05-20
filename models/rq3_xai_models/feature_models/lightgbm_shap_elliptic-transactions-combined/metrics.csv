@@ -1,0 +1,2 @@
+dataset,model,accuracy,precision,recall,f1,roc_auc
+elliptic-transactions-combined,LightGBM balanced,0.9761603756546866,0.9305555555555556,0.6320754716981132,0.7528089887640449,0.948699779832036
