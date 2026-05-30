@@ -1,0 +1,2 @@
+dataset,model,accuracy,precision,recall,f1,roc_auc
+elliptic-wallets-combined,Random Forest balanced,0.9894113534963094,0.8585271317829457,0.7059760956175298,0.774814167031045,0.9812160248457859

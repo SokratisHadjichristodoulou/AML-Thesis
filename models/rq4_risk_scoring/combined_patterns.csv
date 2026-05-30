@@ -1,0 +1,8 @@
+behaviour_pattern,local_shap_count,lime_count,counterfactual_count,mean_counterfactual_reduction
+Transaction timing,27,2.0,8.0,90.8125
+Temporal blockchain activity,23,9.0,11.0,84.72727272727273
+Fee behaviour,20,29.0,25.0,77.44
+Transaction volume,10,0.0,2.0,84.5
+Other,9,13.0,2.0,87.25
+BTC transfer behaviour,8,1.0,2.0,98.75
+Counterparty interaction,2,5.0,0.0,0.0
